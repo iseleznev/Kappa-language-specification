@@ -1,4 +1,4 @@
-# Kappa Language Specification
+# Kappa Language Specification - draft
 
 MIT License
 
