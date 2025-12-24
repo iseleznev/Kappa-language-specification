@@ -1007,10 +1007,11 @@ catch err -> {
 }
 
 // Or with multi-line handler
-catch err ->
+catch { err ->
     logger.error(err.message)
     metrics.increment("errors")
     return Data.empty()
+}
 
 // Useful at end of operation block
 fn loadData(path: string) -> Data {
