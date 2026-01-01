@@ -1744,3 +1744,357 @@ fn main() {
 | `TypeError` | `CastFailed`, `InvalidConversion` |
 | `IoError` | `NotFound`, `PermissionDenied`, `Timeout` |
 | `ConcurrencyError` | `Deadlock`, `LockTimeout`, `ThreadInterrupted` |
+
+
+# Generational References — How They Work
+
+Generational reference (ref) is a "smart pointer" that knows whether the object it points to is still alive. Unlike a raw pointer, ref cannot cause use-after-free — instead, there will be a controlled error (panic).
+
+## Data Structure
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    HEAP                             │
+├─────────────────────────────────────────────────────┤
+│  ┌───────────────────────────────────────────────┐  │
+│  │ ObjectHeader                                  │  │
+│  │ ┌─────────────┬─────────────┐                 │  │
+│  │ │ generation  │ ref_count   │                 │  │
+│  │ │ (32 bit)    │ (32 bit)    │                 │  │
+│  │ └─────────────┴─────────────┘                 │  │
+│  ├───────────────────────────────────────────────┤  │
+│  │ Object Data                                   │  │
+│  │ (struct fields)                               │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│                  STACK / HEAP                       │
+├─────────────────────────────────────────────────────┤
+│  ┌───────────────────────────────────────────────┐  │
+│  │ Ref                                           │  │
+│  │ ┌─────────────┬─────────────┐                 │  │
+│  │ │ ptr         │ expected_gen│                 │  │
+│  │ │ (64 bit)    │ (32 bit)    │                 │  │
+│  │ └─────────────┴─────────────┘                 │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+## Global State
+
+```
+global_generation_counter: uint32 = 1
+```
+
+Each new object receives a unique generation number from this counter.
+
+---
+
+## Algorithm: Object Creation
+
+```kappa
+val user = User("Igor", 46)
+```
+
+**Steps:**
+
+1. Allocate memory: `sizeof(ObjectHeader) + sizeof(User)`
+2. Write to header:
+   - `generation = global_generation_counter++`
+   - `ref_count = 1`
+3. Initialize object fields
+4. Create ref:
+   - `ptr = address of object data (after header)`
+   - `expected_gen = generation from header`
+5. Assign ref to variable `user`
+
+```
+Before:
+  global_generation_counter = 42
+
+After:
+  global_generation_counter = 43
+  
+  Heap:
+  ┌────────────────────┐
+  │ generation = 42    │
+  │ ref_count = 1      │
+  ├────────────────────┤
+  │ name = "Igor"      │
+  │ age = 46           │
+  └────────────────────┘
+  
+  Stack:
+  user.ptr = 0x1000 (data address)
+  user.expected_gen = 42
+```
+
+---
+
+## Algorithm: Creating Another Reference
+
+```kappa
+val user2 = user
+```
+
+**Steps:**
+
+1. Copy ref:
+   - `user2.ptr = user.ptr`
+   - `user2.expected_gen = user.expected_gen`
+2. Increment ref_count in object header:
+   - `header.ref_count++`
+
+```
+After:
+  Heap:
+  ┌────────────────────┐
+  │ generation = 42    │
+  │ ref_count = 2      │  ← was 1, now 2
+  ├────────────────────┤
+  │ name = "Igor"      │
+  │ age = 46           │
+  └────────────────────┘
+  
+  Stack:
+  user.ptr = 0x1000
+  user.expected_gen = 42
+  
+  user2.ptr = 0x1000       ← same address
+  user2.expected_gen = 42  ← same generation
+```
+
+---
+
+## Algorithm: Dereferencing (Read/Write via ref)
+
+```kappa
+println(user.name)    // read
+user.age = 47         // write
+```
+
+**Steps:**
+
+1. Check `ptr != null`:
+   - If null → panic "null pointer dereference"
+2. Read `generation` from object header
+3. Compare with `expected_gen` in ref:
+   - If equal → object is alive, proceed
+   - If not equal → panic "use after free"
+4. Perform read/write operation
+
+```
+Check:
+  ref.expected_gen (42) == header.generation (42) → OK
+  
+  If object had been freed:
+  ref.expected_gen (42) != header.generation (43) → PANIC!
+```
+
+---
+
+## Algorithm: Scope Exit
+
+```kappa
+fn example() {
+    val user = User("Igor", 46)    // ref_count = 1
+    val user2 = user               // ref_count = 2
+    
+    // ... usage ...
+    
+}   // user2 exits scope, then user
+```
+
+**Steps when each variable exits scope:**
+
+1. Decrement `ref_count` in header:
+   - `header.ref_count--`
+2. Check `ref_count == 0`:
+   - If yes → free object
+   - If no → object still needed
+
+**Freeing algorithm:**
+
+1. Increment `generation` in header:
+   - `header.generation++`
+   - This invalidates ALL existing refs to this object
+2. Free memory (or return to pool)
+
+```
+user2 exits scope:
+  ref_count: 2 → 1
+  Object alive
+  
+user exits scope:
+  ref_count: 1 → 0
+  generation: 42 → 43  ← invalidation
+  Memory freed
+```
+
+---
+
+## Algorithm: Reference to Object from Outer Scope
+
+```kappa
+fn outer() {
+    val user = User("Igor", 46)    // generation = 42, ref_count = 1
+    
+    fn inner() {
+        val localRef = user        // ref_count = 2
+        println(localRef.name)     // check: 42 == 42 → OK
+    }   // ref_count = 1
+    
+    println(user.name)             // check: 42 == 42 → OK
+}   // ref_count = 0, freed
+```
+
+**Step by step:**
+
+```
+1. outer() starts
+   - user created
+   - generation = 42, ref_count = 1
+
+2. inner() starts
+   - localRef = user created
+   - ref_count = 2
+   
+3. println(localRef.name) in inner()
+   - Check: localRef.expected_gen (42) == header.generation (42)
+   - OK, read name
+   
+4. inner() ends
+   - localRef exits scope
+   - ref_count: 2 → 1
+   - Object alive (ref_count > 0)
+   
+5. println(user.name) in outer()
+   - Check: user.expected_gen (42) == header.generation (42)
+   - OK, read name
+   
+6. outer() ends
+   - user exits scope
+   - ref_count: 1 → 0
+   - Object freed
+   - generation: 42 → 43
+```
+
+---
+
+## Algorithm: Detecting Use-After-Free
+
+```kappa
+var globalRef: User? = null
+
+fn outer() {
+    val user = User("Igor", 46)    // generation = 42, ref_count = 1
+    globalRef = user               // ref_count = 2
+}   // ref_count = 1 (globalRef still holds)
+
+fn later() {
+    globalRef = null               // ref_count = 0, freed, gen = 43
+}
+
+fn bad() {
+    val oldRef = /* somehow saved ref with gen = 42 */
+    println(oldRef.name)           // PANIC: 42 != 43
+}
+```
+
+**Why this is safe:**
+
+1. When object is freed, `generation` increments
+2. All old refs have old `expected_gen`
+3. On any access through old ref:
+   - `expected_gen (42) != generation (43)`
+   - Panic instead of UB (undefined behavior)
+
+---
+
+## Comparison with Other Approaches
+
+| Approach | Use-after-free | Overhead | Complexity |
+|----------|----------------|----------|------------|
+| Raw pointer (C) | UB — crash or worse | 0% | Low |
+| Borrow checker (Rust) | Compile error | 0% | High |
+| GC (Java, Go) | Impossible | 10-30% + pauses | Low |
+| Generational ref (Kappa) | Runtime panic | 1-3% | Low |
+
+---
+
+## Lifecycle Diagram
+
+```
+     ┌─────────────────────────────────────────────────────────────┐
+     │                                                             │
+     ▼                                                             │
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐           │
+│ Allocate│───▶│ Create  │───▶│  Use    │───▶│ Release │───────────┤
+│ Object  │    │   Ref   │    │  (deref)│    │   Ref   │           │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘           │
+     │              │              │              │                │
+     │              │              │              ▼                │
+     │              │              │         ┌─────────┐           │
+     │              │              │         │ref_count│           │
+     │              │              │         │  == 0?  │           │
+     │              │              │         └────┬────┘           │
+     │              │              │              │                │
+     │              │              │         yes  │  no            │
+     │              │              │              ▼                │
+     │              │              │         ┌─────────┐           │
+     │              │              │         │  Free   │           │
+     │              │              │         │ Object  │           │
+     │              │              │         └────┬────┘           │
+     │              │              │              │                │
+     │              │              │              ▼                │
+     │              │              │         ┌─────────┐           │
+     │              │              │         │ gen++   │           │
+     │              │              │         │(invalid)│           │
+     │              │              │         └─────────┘           │
+     │              │              │                               │
+     │              │              ▼                               │
+     │              │         ┌─────────┐                          │
+     │              │         │ Check:  │                          │
+     │              │         │expected │                          │
+     │              │         │== actual│                          │
+     │              │         └────┬────┘                          │
+     │              │              │                               │
+     │              │         yes  │  no                           │
+     │              │              │   │                           │
+     │              │              ▼   ▼                           │
+     │              │         ┌─────┐ ┌─────┐                      │
+     │              │         │ OK  │ │PANIC│                      │
+     │              │         └─────┘ └─────┘                      │
+     │              │                                              │
+     └──────────────┴──────────────────────────────────────────────┘
+```
+
+---
+
+## Future Optimizations
+
+### 1. Escape Analysis
+
+```kappa
+fn example() {
+    val point = Point(1, 2)    // doesn't escape function
+    println(point.x)
+}
+// Compiler: point can be stack-allocated without ref_count
+```
+
+### 2. Object Pools
+
+```
+Instead of malloc/free — allocation from pool
+Generation stored in pool, not in each object
+```
+
+### 3. Check Inlining
+
+```c
+// Instead of function call
+if (ref.gen != header->gen) panic();
+// Single comparison instruction — almost free
+```
