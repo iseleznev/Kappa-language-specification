@@ -1754,13 +1754,13 @@ Generational reference (ref) is a "smart pointer" that knows whether the object 
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    HEAP                             │
+│                    HEAP                              │
 ├─────────────────────────────────────────────────────┤
 │  ┌───────────────────────────────────────────────┐  │
-│  │ ObjectHeader                                  │  │
+│  │ ObjectHeader                                   │  │
 │  │ ┌─────────────┬─────────────┐                 │  │
 │  │ │ generation  │ ref_count   │                 │  │
-│  │ │ (32 bit)    │ (32 bit)    │                 │  │
+│  │ │ (64 bit)    │ (32 bit)    │                 │  │
 │  │ └─────────────┴─────────────┘                 │  │
 │  ├───────────────────────────────────────────────┤  │
 │  │ Object Data                                   │  │
@@ -1769,25 +1769,29 @@ Generational reference (ref) is a "smart pointer" that knows whether the object 
 └─────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
-│                  STACK / HEAP                       │
+│                  STACK / HEAP                        │
 ├─────────────────────────────────────────────────────┤
 │  ┌───────────────────────────────────────────────┐  │
 │  │ Ref                                           │  │
 │  │ ┌─────────────┬─────────────┐                 │  │
 │  │ │ ptr         │ expected_gen│                 │  │
-│  │ │ (64 bit)    │ (32 bit)    │                 │  │
+│  │ │ (64 bit)    │ (64 bit)    │                 │  │
 │  │ └─────────────┴─────────────┘                 │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
 
+**Why 64-bit generation?**
+
+With 64-bit generation counter, even at 1 billion allocations per second, overflow would take 584 years. This eliminates any possibility of generation collision.
+
 ## Global State
 
 ```
-global_generation_counter: uint32 = 1
+global_generation_counter: uint64 = 1
 ```
 
-Each new object receives a unique generation number from this counter.
+This counter provides unique generation numbers. It increments on every allocation AND every deallocation, ensuring each "lifetime" of a memory slot has a unique identifier.
 
 ---
 
@@ -1806,7 +1810,7 @@ val user = User("Igor", 46)
 3. Initialize object fields
 4. Create ref:
    - `ptr = address of object data (after header)`
-   - `expected_gen = generation from header`
+   - `expected_gen = header.generation`
 5. Assign ref to variable `user`
 
 ```
@@ -1889,12 +1893,12 @@ Check:
   ref.expected_gen (42) == header.generation (42) → OK
   
   If object had been freed:
-  ref.expected_gen (42) != header.generation (43) → PANIC!
+  ref.expected_gen (42) != header.generation (57) → PANIC!
 ```
 
 ---
 
-## Algorithm: Scope Exit
+## Algorithm: Scope Exit and Object Deallocation
 
 ```kappa
 fn example() {
@@ -1911,25 +1915,71 @@ fn example() {
 1. Decrement `ref_count` in header:
    - `header.ref_count--`
 2. Check `ref_count == 0`:
-   - If yes → free object
-   - If no → object still needed
+   - If no → object still needed, done
+   - If yes → deallocate object
 
-**Freeing algorithm:**
+**Deallocation algorithm (critical for safety):**
 
-1. Increment `generation` in header:
-   - `header.generation++`
-   - This invalidates ALL existing refs to this object
-2. Free memory (or return to pool)
+1. **Invalidate the generation:**
+   - `header.generation = global_generation_counter++`
+   - This gives the memory slot a NEW unique generation
+   - All existing refs have OLD generation → they will fail check
+2. Return memory to pool or free
 
 ```
 user2 exits scope:
   ref_count: 2 → 1
-  Object alive
+  Object alive, no deallocation
   
 user exits scope:
   ref_count: 1 → 0
-  generation: 42 → 43  ← invalidation
-  Memory freed
+  
+  Before deallocation:
+    header.generation = 42
+    global_counter = 57
+    
+  Deallocation:
+    header.generation = 57  ← NEW unique generation
+    global_counter = 58
+    Memory returned to pool
+    
+  Any old ref with expected_gen = 42 will now fail:
+    42 != 57 → PANIC
+```
+
+---
+
+## Why Generation Changes on Deallocation
+
+This is the key insight that prevents use-after-free:
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────
+
+1. Object A allocated at address 0x1000
+   header.generation = 42
+   ref_A.expected_gen = 42
+   global_counter = 43
+
+2. Object A deallocated
+   header.generation = 43  ← CHANGES!
+   global_counter = 44
+   Memory at 0x1000 returned to pool
+   
+3. Object B allocated, reuses address 0x1000
+   header.generation = 44  ← NEW generation
+   ref_B.expected_gen = 44
+   global_counter = 45
+
+4. Someone tries to use old ref_A:
+   ref_A.ptr = 0x1000
+   ref_A.expected_gen = 42
+   header.generation = 44 (Object B's generation)
+   
+   Check: 42 != 44 → PANIC! ✓
+   
+   Use-after-free prevented!
 ```
 
 ---
@@ -1946,19 +1996,21 @@ fn outer() {
     }   // ref_count = 1
     
     println(user.name)             // check: 42 == 42 → OK
-}   // ref_count = 0, freed
+}   // ref_count = 0, deallocated, generation changes
 ```
 
 **Step by step:**
 
 ```
 1. outer() starts
-   - user created
-   - generation = 42, ref_count = 1
+   - user created at address 0x1000
+   - header.generation = 42
+   - header.ref_count = 1
+   - global_counter = 43
 
 2. inner() starts
-   - localRef = user created
-   - ref_count = 2
+   - localRef = user
+   - ref_count: 1 → 2
    
 3. println(localRef.name) in inner()
    - Check: localRef.expected_gen (42) == header.generation (42)
@@ -1967,7 +2019,8 @@ fn outer() {
 4. inner() ends
    - localRef exits scope
    - ref_count: 2 → 1
-   - Object alive (ref_count > 0)
+   - ref_count > 0, no deallocation
+   - header.generation still 42
    
 5. println(user.name) in outer()
    - Check: user.expected_gen (42) == header.generation (42)
@@ -1976,8 +2029,9 @@ fn outer() {
 6. outer() ends
    - user exits scope
    - ref_count: 1 → 0
-   - Object freed
-   - generation: 42 → 43
+   - ref_count == 0, DEALLOCATE:
+     - header.generation = global_counter++ = 43
+     - Memory returned to pool
 ```
 
 ---
@@ -1987,28 +2041,60 @@ fn outer() {
 ```kappa
 var globalRef: User? = null
 
-fn outer() {
+fn setup() {
     val user = User("Igor", 46)    // generation = 42, ref_count = 1
     globalRef = user               // ref_count = 2
-}   // ref_count = 1 (globalRef still holds)
+}   // user exits scope, ref_count = 1, object ALIVE
 
-fn later() {
-    globalRef = null               // ref_count = 0, freed, gen = 43
+fn cleanup() {
+    globalRef = null               // ref_count = 0, DEALLOCATED
+                                   // generation: 42 → 57
 }
 
-fn bad() {
-    val oldRef = /* somehow saved ref with gen = 42 */
-    println(oldRef.name)           // PANIC: 42 != 43
+fn bad(oldRef: User) {             // oldRef.expected_gen = 42
+    println(oldRef.name)           // Check: 42 != 57 → PANIC!
 }
 ```
 
 **Why this is safe:**
 
-1. When object is freed, `generation` increments
-2. All old refs have old `expected_gen`
+1. When object is deallocated, it gets a NEW generation from global counter
+2. All existing refs still have the OLD expected_gen
 3. On any access through old ref:
-   - `expected_gen (42) != generation (43)`
+   - `expected_gen (old) != generation (new)`
    - Panic instead of UB (undefined behavior)
+
+---
+
+## Memory Reuse Safety
+
+The algorithm is safe even when memory is reused:
+
+```
+Scenario: Memory pool reuses address 0x1000
+
+Step 1: Object A at 0x1000
+  header.generation = 100
+  ref_A.expected_gen = 100
+
+Step 2: Object A deallocated
+  header.generation = 200  ← new generation
+  Address 0x1000 in pool
+
+Step 3: Object B allocated at 0x1000 (reused!)
+  header.generation = 201  ← another new generation
+  ref_B.expected_gen = 201
+
+Step 4: Old ref_A used
+  ptr = 0x1000 (same address!)
+  expected_gen = 100
+  header.generation = 201
+  
+  100 != 201 → PANIC ✓
+
+The old ref cannot accidentally access the new object,
+even though they share the same memory address.
+```
 
 ---
 
@@ -2021,6 +2107,8 @@ fn bad() {
 | GC (Java, Go) | Impossible | 10-30% + pauses | Low |
 | Generational ref (Kappa) | Runtime panic | 1-3% | Low |
 
+**Kappa's tradeoff:** Small runtime overhead (~1-3%) for memory safety without compile-time complexity. The check is just one comparison instruction — almost free on modern CPUs.
+
 ---
 
 ## Lifecycle Diagram
@@ -2029,46 +2117,56 @@ fn bad() {
      ┌─────────────────────────────────────────────────────────────┐
      │                                                             │
      ▼                                                             │
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐           │
-│ Allocate│───▶│ Create  │───▶│  Use    │───▶│ Release │───────────┤
-│ Object  │    │   Ref   │    │  (deref)│    │   Ref   │           │
-└─────────┘    └─────────┘    └─────────┘    └─────────┘           │
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐          │
+│ Allocate│───▶│ Create  │───▶│  Use    │───▶│ Release │──────────┤
+│ Object  │    │   Ref   │    │  (deref)│    │   Ref   │          │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘          │
      │              │              │              │                │
+     │         gen = N        check gen      ref_count--           │
+     │        ref_count++                         │                │
      │              │              │              ▼                │
-     │              │              │         ┌─────────┐           │
-     │              │              │         │ref_count│           │
-     │              │              │         │  == 0?  │           │
-     │              │              │         └────┬────┘           │
+     │              │              │         ┌─────────┐          │
+     │              │              │         │ref_count│          │
+     │              │              │         │  == 0?  │          │
+     │              │              │         └────┬────┘          │
      │              │              │              │                │
      │              │              │         yes  │  no            │
      │              │              │              ▼                │
-     │              │              │         ┌─────────┐           │
-     │              │              │         │  Free   │           │
-     │              │              │         │ Object  │           │
-     │              │              │         └────┬────┘           │
-     │              │              │              │                │
-     │              │              │              ▼                │
-     │              │              │         ┌─────────┐           │
-     │              │              │         │ gen++   │           │
-     │              │              │         │(invalid)│           │
-     │              │              │         └─────────┘           │
+     │              │              │    ┌──────────────────┐      │
+     │              │              │    │   Deallocate     │      │
+     │              │              │    │                  │      │
+     │              │              │    │ gen = counter++  │      │
+     │              │              │    │ return to pool   │      │
+     │              │              │    └──────────────────┘      │
      │              │              │                               │
      │              │              ▼                               │
-     │              │         ┌─────────┐                          │
-     │              │         │ Check:  │                          │
-     │              │         │expected │                          │
-     │              │         │== actual│                          │
-     │              │         └────┬────┘                          │
+     │              │         ┌─────────┐                         │
+     │              │         │ Check:  │                         │
+     │              │         │expected │                         │
+     │              │         │== actual│                         │
+     │              │         └────┬────┘                         │
      │              │              │                               │
-     │              │         yes  │  no                           │
+     │              │         yes  │  no                          │
      │              │              │   │                           │
      │              │              ▼   ▼                           │
-     │              │         ┌─────┐ ┌─────┐                      │
-     │              │         │ OK  │ │PANIC│                      │
-     │              │         └─────┘ └─────┘                      │
+     │              │         ┌─────┐ ┌─────┐                     │
+     │              │         │ OK  │ │PANIC│                     │
+     │              │         └─────┘ └─────┘                     │
      │              │                                              │
      └──────────────┴──────────────────────────────────────────────┘
 ```
+
+---
+
+## Summary: The Key Rules
+
+1. **Allocation:** Object gets unique generation from global counter
+2. **Ref creation:** Ref copies the current generation as expected_gen
+3. **Deref check:** expected_gen must equal header.generation
+4. **Deallocation:** Object gets NEW generation from global counter
+5. **Memory reuse:** Safe because deallocated slot has different generation
+
+This ensures that **every lifetime of every memory slot has a unique generation**, making it impossible to accidentally access freed memory.
 
 ---
 
@@ -2084,17 +2182,24 @@ fn example() {
 // Compiler: point can be stack-allocated without ref_count
 ```
 
-### 2. Object Pools
+### 2. Object Pools with Generation Tracking
 
 ```
-Instead of malloc/free — allocation from pool
-Generation stored in pool, not in each object
+Pool tracks generation per slot
+Avoids header overhead for small objects
 ```
 
 ### 3. Check Inlining
 
 ```c
-// Instead of function call
+// Compiled to single comparison
 if (ref.gen != header->gen) panic();
-// Single comparison instruction — almost free
+// ~1 CPU cycle on modern processors
+```
+
+### 4. Batch Deallocation
+
+```
+Defer generation updates for batch deallocations
+Reduces global counter contention in multithreaded code
 ```
